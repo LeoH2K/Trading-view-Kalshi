@@ -1,0 +1,578 @@
+//@version=6
+// ═════════════════════════════════════════════════════════════════════════════
+//  Kalshi BTC 15-Minute Up/Down: Price to Beat & Fair Odds
+// ═════════════════════════════════════════════════════════════════════════════
+//  For Kalshi's 15-minute Bitcoin markets (series KXBTC15M).
+//
+//  How those contracts settle:
+//    • Each market covers one 15-minute window aligned to :00 / :15 / :30 / :45 ET.
+//    • TARGET ("price to beat") = simple average of the 60 one-second CF Benchmarks
+//      BRTI values in the minute BEFORE the window opens.
+//    • SETTLEMENT = simple average of the 60 one-second BRTI values in the LAST
+//      minute of the window. YES ("up") wins if settlement >= target.
+//    • So each window's settlement is the next window's target.
+//
+//  What this script does:
+//    1. Builds a BRTI stand-in from USD spot exchanges (or uses the chart symbol).
+//    2. Estimates the target and, during the final minute, the part of the
+//       settlement average that is already locked in.
+//    3. Measures realized volatility and turns "distance to target vs. time left"
+//       into a fair probability of YES (= fair price in cents), accounting for the
+//       60-second averaging and, optionally, fat tails.
+//    4. Shows the highest YES/NO price still worth paying after Kalshi's fee, a
+//       momentum bias, and self-check stats on this chart's own history.
+//
+//  It is an analysis aid, not financial advice. Kalshi shows the official target
+//  on each market page; this proxy can differ from BRTI by a few dollars.
+// ═════════════════════════════════════════════════════════════════════════════
+indicator("Kalshi BTC 15m: Price to Beat & Fair Odds", shorttitle = "Kalshi BTC 15m", overlay = false, precision = 1, max_lines_count = 500, max_labels_count = 500)
+
+// ─── Inputs ──────────────────────────────────────────────────────────────────
+const string G_MKT  = "Kalshi market"
+const string G_SRC  = "Price source (BRTI proxy)"
+const string G_MOD  = "Probability model"
+const string G_TRD  = "Trade thresholds"
+const string G_BIAS = "Momentum bias"
+const string G_VIS  = "Display"
+const string G_STAT = "Self-check stats"
+
+int    winMin  = input.int(15, "Window length (minutes)", minval = 1, maxval = 240, group = G_MKT, tooltip = "KXBTC15M windows are 15 minutes long and aligned to the clock (:00, :15, :30, :45).")
+int    avgSec  = input.int(60, "Averaging period (seconds)", minval = 1, maxval = 900, group = G_MKT, tooltip = "Kalshi averages 60 one-second BRTI values: the minute before the open sets the target, the last minute of the window sets the settlement.")
+string tzName  = input.string("America/New_York", "Time zone for labels", group = G_MKT, tooltip = "IANA time zone name. Kalshi lists these markets in ET (America/New_York).")
+
+string srcMode  = input.string("USD spot composite", "Price source", options = ["USD spot composite", "Chart symbol"], group = G_SRC, tooltip = "Kalshi settles on CF Benchmarks' BRTI, which is built from USD spot order books. The composite averages the exchanges below as a stand-in. 'Chart symbol' uses the chart's own prices; avoid USDT pairs, which trade at a premium or discount to USD.")
+bool   ex1On    = input.bool(true, "", inline = "ex1", group = G_SRC)
+string ex1      = input.symbol("COINBASE:BTCUSD", "Exchange 1", inline = "ex1", group = G_SRC)
+bool   ex2On    = input.bool(true, "", inline = "ex2", group = G_SRC)
+string ex2      = input.symbol("KRAKEN:BTCUSD", "Exchange 2", inline = "ex2", group = G_SRC)
+bool   ex3On    = input.bool(true, "", inline = "ex3", group = G_SRC)
+string ex3      = input.symbol("BITSTAMP:BTCUSD", "Exchange 3", inline = "ex3", group = G_SRC)
+bool   ex4On    = input.bool(true, "", inline = "ex4", group = G_SRC)
+string ex4      = input.symbol("GEMINI:BTCUSD", "Exchange 4", inline = "ex4", group = G_SRC)
+bool   useTicks = input.bool(true, "Refine averages with live ticks", group = G_SRC, tooltip = "While the chart runs in real time, every tick inside an averaging minute is time-weighted. That is more exact than estimating the minute from bars. After a reload, past windows fall back to bar estimates.")
+
+int   volLookMin = input.int(60, "Volatility lookback (minutes)", minval = 5, maxval = 1440, group = G_MOD, tooltip = "EWMA span, in minutes, of squared 1-minute log returns. Shorter reacts faster to volatility spikes.")
+float volMult    = input.float(1.0, "Volatility multiplier", minval = 0.25, maxval = 4.0, step = 0.05, group = G_MOD, tooltip = "Scales the volatility estimate. Check the calibration row: if 'real' is above 'pred' the model is too cautious, so lower this. If 'real' is below 'pred', raise it.")
+int   tailNu     = input.int(6, "Fat tails: Student-t ν (0 = normal)", options = [0, 4, 6, 8, 12, 20], group = G_MOD, tooltip = "Short-term BTC moves have fatter tails than a normal curve. Lower ν means fatter tails: more room for a late reversal when price is far from the target.")
+float tiltK      = input.float(0.0, "Momentum tilt", minval = 0.0, maxval = 1.0, step = 0.05, group = G_MOD, tooltip = "0 = pure random-walk fair value (the unbiased baseline). Above 0, the momentum bias shifts the forecast. At 0.5, a full-strength bias (±1) at the open shifts it by half a standard deviation, fading as the window runs out.")
+
+float hiThr = input.float(65.0, "UP favored when P(UP) ≥ %", minval = 50.0, maxval = 99.0, step = 1.0, group = G_TRD)
+float loThr = input.float(35.0, "DOWN favored when P(UP) ≤ %", minval = 1.0, maxval = 50.0, step = 1.0, group = G_TRD)
+float feeK  = input.float(0.07, "Kalshi fee coefficient", minval = 0.0, maxval = 0.2, step = 0.005, group = G_TRD, tooltip = "Kalshi's fee per contract is about coefficient × price × (1 − price). 0.07 is the standard taker rate. Set 0 to ignore fees.")
+float edgeC = input.float(3.0, "Required edge (¢ per contract)", minval = 0.0, maxval = 25.0, step = 0.5, group = G_TRD, tooltip = "'Value buy ≤' shows the highest price that still leaves at least this much expected profit per contract after fees.")
+
+int   fastMin = input.int(3, "Fast EMA (minutes)", minval = 1, maxval = 120, group = G_BIAS)
+int   slowMin = input.int(12, "Slow EMA (minutes)", minval = 2, maxval = 480, group = G_BIAS)
+int   momMin  = input.int(5, "Momentum lookback (minutes)", minval = 1, maxval = 240, group = G_BIAS)
+int   vwapMin = input.int(60, "Rolling VWAP (minutes)", minval = 5, maxval = 1440, group = G_BIAS)
+int   flowMin = input.int(10, "Buy/sell pressure lookback (minutes)", minval = 1, maxval = 240, group = G_BIAS)
+float leanThr = input.float(0.25, "Lean threshold", minval = 0.05, maxval = 0.9, step = 0.05, group = G_BIAS, tooltip = "A bias beyond ±this value is shown as an UP/DOWN lean. The bias averages four trend-following components (EMA trend, momentum, distance from VWAP, buy/sell pressure), each scaled to −1…+1.")
+
+bool   showTable = input.bool(true, "Dashboard", inline = "tb", group = G_VIS)
+bool   compactTb = input.bool(false, "Compact", inline = "tb", group = G_VIS)
+string tbPos     = input.string(position.top_right, "Dashboard position", options = [position.top_right, position.middle_right, position.bottom_right, position.top_left, position.middle_left, position.bottom_left], group = G_VIS)
+string tbSize    = input.string(size.small, "Dashboard text size", options = [size.tiny, size.small, size.normal, size.large], group = G_VIS)
+bool   showLines = input.bool(true, "Price-to-beat lines", group = G_VIS)
+bool   showMarks = input.bool(true, "Window result markers (▲ / ▼)", group = G_VIS)
+bool   showCone  = input.bool(true, "Expected-range cone to the close", group = G_VIS)
+bool   showZone  = input.bool(true, "Shade the averaging minutes", group = G_VIS)
+bool   showProxy = input.bool(false, "Plot the composite price on the chart", group = G_VIS)
+bool   showBias  = input.bool(true, "Momentum bias columns in the pane", group = G_VIS)
+color  colUp     = input.color(#26A69A, "Up", inline = "col", group = G_VIS)
+color  colDn     = input.color(#EF5350, "Down", inline = "col", group = G_VIS)
+color  colTgt    = input.color(#FFB300, "Target", inline = "col", group = G_VIS)
+
+int statN = input.int(96, "Windows to evaluate", minval = 10, maxval = 2000, group = G_STAT, tooltip = "96 windows = 24 hours of 15-minute markets.")
+int ckMin = input.int(10, "Calibration checkpoint (minutes into window)", minval = 1, maxval = 239, group = G_STAT, tooltip = "The model's P(UP) at this point in each window is compared with how the window actually settled.")
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+const color C_TXT = #D1D4DC
+const color C_DIM = #9598A1
+const color C_BG  = #131722
+const color C_NEU = #787B86
+
+// ─── Math helpers ────────────────────────────────────────────────────────────
+// Standard normal CDF (Abramowitz & Stegun 26.2.17, |error| < 7.5e-8).
+f_normCdf(float z) =>
+    float t = 1.0 / (1.0 + 0.2316419 * math.abs(z))
+    float d = 0.3989422804014327 * math.exp(-0.5 * z * z)
+    float q = d * t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))))
+    z >= 0 ? 1.0 - q : q
+
+// Student-t CDF for an even number of degrees of freedom (exact closed form).
+f_tCdfEven(float x, int nu) =>
+    float th  = math.atan(x / math.sqrt(nu))
+    float c2  = math.pow(math.cos(th), 2)
+    float trm = 1.0
+    float acc = 1.0
+    int   kMx = int(nu / 2) - 1
+    if kMx >= 1
+        for k = 1 to kMx
+            trm := trm * c2 * (2.0 * k - 1.0) / (2.0 * k)
+            acc += trm
+    0.5 + 0.5 * math.sin(th) * acc
+
+// CDF of a unit-variance distribution: normal (nu = 0) or Student-t rescaled to variance 1.
+f_cdf(float z, int nu) =>
+    nu <= 2 ? f_normCdf(z) : f_tCdfEven(z * math.sqrt(nu / (nu - 2.0)), nu)
+
+// Maps any real number into (−1, +1).
+f_squash(float x) =>
+    na(x) ? na : x / math.sqrt(1.0 + x * x)
+
+// Mean of up to four values, skipping disabled or missing ones.
+f_mean4(float a, float b, float c, float d, bool ea, bool eb, bool ec, bool ed) =>
+    float s = 0.0
+    int   n = 0
+    if ea and not na(a)
+        s += a
+        n += 1
+    if eb and not na(b)
+        s += b
+        n += 1
+    if ec and not na(c)
+        s += c
+        n += 1
+    if ed and not na(d)
+        s += d
+        n += 1
+    n > 0 ? s / n : na
+
+// ─── Settlement model ────────────────────────────────────────────────────────
+// Log-price is modelled as Brownian motion. Volatility `sig` is in basis points
+// per √minute and drift `mu` in basis points per minute (both kept well-scaled on
+// purpose). Inputs: S = current price, K = target, tRem = ms to the close,
+// R = average so far inside the final averaging period (na if it has not
+// started), aMs = averaging period in ms.
+//  • While the whole averaging period is still ahead, the settlement average has
+//    log-variance σ²·(tRem − 2·aMs/3): averaging removes 2/3 of the variance of
+//    the last aMs.
+//  • Inside the period, the elapsed part is locked in. The rest of the average
+//    must clear kEff = (aMs·K − elapsed·R) / tRem, with log-variance σ²·tRem/3.
+
+// Log-price standard deviation over `ms` milliseconds.
+f_sdLog(float sig, float ms) =>
+    sig / 10000.0 * math.sqrt(ms / 60000.0)
+
+// Log-price drift over `ms` milliseconds.
+f_drift(float mu, float ms) =>
+    mu / 10000.0 * ms / 60000.0
+
+// Standardized distance of the expected settlement above the target.
+f_zScore(float S, float K, int tRem, float R, float sig, float mu, int aMs) =>
+    float z = na
+    if not na(S) and not na(K) and not na(sig) and S > 0 and K > 0 and sig > 0 and tRem > 0
+        if tRem > aMs
+            z := (math.log(S / K) + f_drift(mu, tRem - aMs / 2.0)) / f_sdLog(sig, tRem - 2.0 * aMs / 3.0)
+        else
+            float rr   = na(R) ? S : R
+            float kEff = (aMs * K - (aMs - tRem) * rr) / tRem
+            z := kEff <= 0 ? 10.0 : (math.log(S / kEff) + f_drift(mu, tRem / 2.0)) / f_sdLog(sig, tRem / 3.0)
+    z
+
+// Probability that the settlement average finishes at or above the target.
+f_probUp(float S, float K, int tRem, float R, float sig, float mu, int aMs, int nu) =>
+    float p = na
+    if not na(S) and not na(K)
+        if tRem <= 0
+            p := (na(R) ? S : R) >= K ? 1.0 : 0.0
+        else
+            float z = f_zScore(S, K, tRem, R, sig, mu, aMs)
+            p := na(z) ? na : f_cdf(z, nu)
+    p
+
+// Settlement-average level at z standard deviations (z = 0 gives the median).
+f_settleQ(float S, int tRem, float R, float sig, float mu, int aMs, float z) =>
+    float q = na
+    if not na(S) and not na(sig)
+        if tRem <= 0
+            q := na(R) ? S : R
+        else if tRem > aMs
+            q := S * math.exp(f_drift(mu, tRem - aMs / 2.0) + z * f_sdLog(sig, tRem - 2.0 * aMs / 3.0))
+        else
+            float rr = na(R) ? S : R
+            float y  = S * math.exp(f_drift(mu, tRem / 2.0) + z * f_sdLog(sig, tRem / 3.0))
+            q := ((aMs - tRem) * rr + tRem * y) / aMs
+    q
+
+// Highest whole-cent price at which a contract worth `q` (0…1) still leaves `edge`
+// dollars of expected profit after a fee of fee·p·(1 − p). Returns 0 if none does.
+f_maxBuy(float q, float fee, float edge) =>
+    int best = 0
+    if not na(q)
+        for c = 1 to 99
+            float pr = c / 100.0
+            if q - pr - fee * pr * (1.0 - pr) >= edge
+                best := c
+    best
+
+// ─── Formatting helpers ──────────────────────────────────────────────────────
+f_usd(float x) =>
+    na(x) ? "—" : "$" + str.tostring(x, "#,##0.00")
+f_usd0(float x) =>
+    na(x) ? "—" : "$" + str.tostring(x, "#,##0")
+f_sgnUsd(float x) =>
+    na(x) ? "—" : (x >= 0 ? "+$" : "−$") + str.tostring(math.abs(x), "#,##0.00")
+f_sgn2(float x) =>
+    na(x) ? "—" : (x >= 0 ? "+" : "−") + str.tostring(math.abs(x), "0.00")
+f_pct(float p) =>
+    na(p) ? "—" : str.tostring(p * 100.0, "0.0") + "%"
+f_cents(float p) =>
+    na(p) ? "—" : str.tostring(math.round(p * 100.0)) + "¢"
+f_mmss(int ms) =>
+    int s = int(math.max(0, ms) / 1000)
+    str.tostring(int(s / 60)) + ":" + str.tostring(s % 60, "00")
+
+// One dashboard row; returns the next row index.
+f_row(table tb, int r, string k, string v, color vTxt, color vBg, string tip, string sz) =>
+    tb.cell(0, r, k, text_color = C_DIM, text_halign = text.align_left, text_size = sz, tooltip = tip)
+    tb.cell(1, r, v, text_color = vTxt, bgcolor = vBg, text_halign = text.align_right, text_size = sz, tooltip = tip)
+    r + 1
+
+// Rolling stats over finished windows.
+f_stats(array<int> outs, array<int> bs, array<float> cks) =>
+    int   n     = outs.size()
+    int   ups   = 0
+    int   bN    = 0
+    int   bHit  = 0
+    int   cN    = 0
+    int   cWin  = 0
+    float cPred = 0.0
+    if n > 0
+        for i = 0 to n - 1
+            int o = outs.get(i)
+            ups += o
+            int b = bs.get(i)
+            if b != 0
+                bN += 1
+                if (b > 0 and o == 1) or (b < 0 and o == 0)
+                    bHit += 1
+            float p = cks.get(i)
+            if not na(p)
+                bool favUp = p >= 0.5
+                cN += 1
+                cPred += favUp ? p : 1.0 - p
+                if (favUp and o == 1) or (not favUp and o == 0)
+                    cWin += 1
+    [n, ups, bN, bHit, cN, cWin, cPred]
+
+// ─── Price source ────────────────────────────────────────────────────────────
+bool useComp = srcMode == "USD spot composite"
+bool e1 = useComp and ex1On
+bool e2 = useComp and ex2On
+bool e3 = useComp and ex3On
+bool e4 = useComp and ex4On
+// Disabled slots request the chart symbol, which keeps every request static and cheap.
+[o1, h1, l1, c1, v1] = request.security(e1 ? ex1 : syminfo.tickerid, timeframe.period, [open, high, low, close, volume], ignore_invalid_symbol = true)
+[o2, h2, l2, c2, v2] = request.security(e2 ? ex2 : syminfo.tickerid, timeframe.period, [open, high, low, close, volume], ignore_invalid_symbol = true)
+[o3, h3, l3, c3, v3] = request.security(e3 ? ex3 : syminfo.tickerid, timeframe.period, [open, high, low, close, volume], ignore_invalid_symbol = true)
+[o4, h4, l4, c4, v4] = request.security(e4 ? ex4 : syminfo.tickerid, timeframe.period, [open, high, low, close, volume], ignore_invalid_symbol = true)
+
+int   nOn    = (e1 ? 1 : 0) + (e2 ? 1 : 0) + (e3 ? 1 : 0) + (e4 ? 1 : 0)
+int   nLive  = (e1 and not na(c1) ? 1 : 0) + (e2 and not na(c2) ? 1 : 0) + (e3 and not na(c3) ? 1 : 0) + (e4 and not na(c4) ? 1 : 0)
+bool  compOk = useComp and nLive > 0
+float cmpO   = f_mean4(o1, o2, o3, o4, e1, e2, e3, e4)
+float cmpH   = f_mean4(h1, h2, h3, h4, e1, e2, e3, e4)
+float cmpL   = f_mean4(l1, l2, l3, l4, e1, e2, e3, e4)
+float cmpC   = f_mean4(c1, c2, c3, c4, e1, e2, e3, e4)
+float cmpV   = (e1 ? nz(v1) : 0.0) + (e2 ? nz(v2) : 0.0) + (e3 ? nz(v3) : 0.0) + (e4 ? nz(v4) : 0.0)
+float pxO    = compOk ? cmpO : open
+float pxH    = compOk ? cmpH : high
+float pxL    = compOk ? cmpL : low
+float pxC    = compOk ? cmpC : close
+float pxV    = compOk ? cmpV : nz(volume)
+float px3    = (pxH + pxL + pxC) / 3.0
+// Estimate of a bar's time-average price. For a random walk, extra weight on the
+// high/low beats OHLC4 (Monte Carlo: ~20% smaller error vs. the true 60 s mean)
+// and stays robust when single exchanges print wicks.
+float pxAvg  = (pxO + pxC + 3.0 * (pxH + pxL)) / 8.0
+
+// ─── Window clock ────────────────────────────────────────────────────────────
+int  barMs  = timeframe.in_seconds() * 1000
+int  winMs  = winMin * 60000
+int  avgMs  = math.min(avgSec * 1000, winMs)
+bool tfOk   = timeframe.isintraday and barMs <= winMs and winMs % barMs == 0
+int  wStart = math.floor(time / winMs) * winMs
+int  wEnd   = wStart + winMs
+int  zStart = wEnd - avgMs                       // this window's settlement-averaging period starts here
+bool newWin = na(wStart[1]) or wStart != wStart[1]
+int  tClose = na(time_close) ? time + barMs : time_close
+int  tEval  = barstate.islast ? math.min(timenow, tClose) : tClose   // "now" as of this bar
+int  tRem   = math.max(0, wEnd - tEval)
+int  tEl    = tEval - wStart
+
+// ─── Realized volatility (basis points per √minute) ─────────────────────────
+int   bpm    = math.max(1, math.round(60000.0 / barMs))     // bars per ~1-minute return
+float lrBp   = 10000.0 * math.log(pxC / pxC[bpm])           // log return in basis points
+float alphaV = 2.0 / (math.max(10.0, volLookMin * 60000.0 / barMs) + 1.0)
+var float ewVar = na                                         // EWMA of squared returns (bp²)
+if not na(lrBp)
+    ewVar := na(ewVar) ? lrBp * lrBp : ewVar + alphaV * (lrBp * lrBp - ewVar)
+// Floor of 0.775 bp/√min ≈ 0.03% per 15 minutes keeps odds sane on frozen data.
+float sig   = na(ewVar) ? na : math.max(math.sqrt(ewVar * 60000.0 / (bpm * barMs)), 0.775) * volMult
+float sdWin = na(sig) ? na : pxC * f_sdLog(sig, winMs)      // $ size of a 1σ move over a full window
+
+// ─── Momentum bias (−1 … +1) ─────────────────────────────────────────────────
+int   lenF  = math.max(1, math.round(fastMin * 60000.0 / barMs))
+int   lenS  = math.max(lenF + 1, math.round(slowMin * 60000.0 / barMs))
+int   lenM  = math.max(1, math.round(momMin * 60000.0 / barMs))
+int   lenV  = math.max(2, math.round(vwapMin * 60000.0 / barMs))
+int   lenFl = math.max(1, math.round(flowMin * 60000.0 / barMs))
+float emaF  = ta.ema(pxC, lenF)
+float emaS  = ta.ema(pxC, lenS)
+float sumPV = math.sum(px3 * pxV, lenV)
+float sumV  = math.sum(pxV, lenV)
+float vwapR = sumV > 0 ? sumPV / sumV : na
+float rngHL = pxH - pxL
+float clv   = rngHL > 0 ? (2.0 * pxC - pxH - pxL) / rngHL : 0.0
+float sumCV = math.sum(clv * pxV, lenFl)
+float sumFV = math.sum(pxV, lenFl)
+float flow  = sumFV > 0 ? sumCV / sumFV : na
+float pxCM  = pxC[lenM]
+// Each component is scaled so that a driftless random walk gives roughly ±1 (1σ).
+float zTrend = na(sig) ? na : (emaF - emaS) / (pxC * f_sdLog(sig, lenS * barMs / 2.0))
+float zMom   = na(sig) or na(pxCM) ? na : math.log(pxC / pxCM) / f_sdLog(sig, lenM * barMs)
+float zVwap  = na(sig) or na(vwapR) ? na : math.log(pxC / vwapR) / f_sdLog(sig, lenV * barMs / 3.0)
+float zFlow  = na(flow) ? na : flow * math.sqrt(lenFl) / 0.6
+float bias   = nz(f_mean4(f_squash(zTrend), f_squash(zMom), f_squash(zVwap), f_squash(zFlow), true, true, true, true))
+float biasPrev = nz(bias[1])
+int   biasDir  = bias > leanThr ? 1 : bias < -leanThr ? -1 : 0
+
+// ─── Live tick sampling of the averaging minutes (real time only) ───────────
+varip float tkInt  = 0.0     // ∫ price dt over the averaging period being sampled
+varip float tkCov  = 0.0     // ms of that period covered by ticks
+varip int   tkEnd  = 0       // close time of the period being sampled (0 = idle)
+varip int   tkLT   = 0       // time of the last sampled tick
+varip float tkLP   = na      // price of the last sampled tick
+varip float tkFAvg = na      // last finished period: average
+varip float tkFCov = 0.0     //                       ms covered
+varip int   tkFEnd = 0       //                       close time
+varip float tkPAvg = na      // the finished period before that (kept so a bar
+varip float tkPCov = 0.0     // spanning a whole window can still read its own
+varip int   tkPEnd = 0       // target after the next period has closed)
+varip int   anyT   = 0       // most recent tick, sampled or not
+varip float anyP   = na
+
+if useTicks and barstate.isrealtime and not na(pxC)
+    int tNow = timenow
+    // Close out a period that has ended: the last price holds until the period's end.
+    if tkEnd != 0 and tNow >= tkEnd
+        if not na(tkLP) and tkEnd > tkLT
+            tkInt += tkLP * (tkEnd - tkLT)
+            tkCov += tkEnd - tkLT
+        tkPAvg := tkFAvg
+        tkPCov := tkFCov
+        tkPEnd := tkFEnd
+        tkFAvg := tkCov > 0 ? tkInt / tkCov : na
+        tkFCov := tkCov
+        tkFEnd := tkEnd
+        tkEnd  := 0
+    int perEnd   = (math.floor(tNow / winMs) + 1) * winMs
+    int perStart = perEnd - avgMs
+    if tNow >= perStart
+        if tkEnd != perEnd
+            tkEnd := perEnd
+            tkInt := 0.0
+            tkCov := 0.0
+            // Back-fill from the period's start with the previous tick if it is recent.
+            if anyT > 0 and anyT <= perStart and perStart - anyT <= 5000 and not na(anyP)
+                tkInt := anyP * (tNow - perStart)
+                tkCov := tNow - perStart
+        else if tNow > tkLT
+            tkInt += tkLP * (tNow - tkLT)
+            tkCov += tNow - tkLT
+        tkLT := tNow
+        tkLP := pxC
+    anyT := tNow
+    anyP := pxC
+
+// ─── Averaging periods from bars (works on history) ─────────────────────────
+var float accSum = 0.0
+var float accW   = 0.0
+var int   accEnd = 0         // close time of the averaging period being accumulated
+
+// Settlement of the previous bar's window, read before this bar is accumulated.
+// When windows are contiguous, it is also the target of the window opening now.
+int   prevEnd    = nz(wEnd[1])
+float sBarPrev   = accEnd == prevEnd and accW >= 0.5 * avgMs ? accSum / accW : na
+float sTickPrev  = not useTicks ? na : tkFEnd == prevEnd and tkFCov >= 0.9 * avgMs ? tkFAvg : tkPEnd == prevEnd and tkPCov >= 0.9 * avgMs ? tkPAvg : na
+float settlePrev = not na(sTickPrev) ? sTickPrev : sBarPrev
+
+// This bar's overlap with its window's averaging period. A bar fully inside the
+// period contributes its time-average estimate; a wider bar contributes its close.
+int   ovA    = math.max(time, zStart)
+int   ovB    = math.min(time + barMs, wEnd, tEval)
+int   ov     = math.max(0, ovB - ovA)
+float barRep = time >= zStart ? pxAvg : pxC
+if ov > 0 and not na(barRep)
+    if accEnd != wEnd
+        accEnd := wEnd
+        accSum := 0.0
+        accW   := 0.0
+    accSum += barRep * ov
+    accW   += ov
+
+// Part of the current settlement average that is already locked in. Ticks are
+// preferred while they cover ≥ 90% of the elapsed period; once the period has
+// closed (e.g. on the bar's closing update), its finalized tick average is used.
+float rTick = na
+if useTicks and barstate.isrealtime
+    if tkEnd == wEnd and tkCov > 0 and tkCov >= 0.9 * (tEval - zStart)
+        rTick := tkInt / tkCov
+    else if tkFEnd == wEnd and tkFCov >= 0.9 * avgMs
+        rTick := tkFAvg
+float rBar  = accEnd == wEnd and accW > 0 ? accSum / accW : na
+float rZone = tEval > zStart ? (not na(rTick) ? rTick : rBar) : na
+
+// ─── Per-window state ────────────────────────────────────────────────────────
+var float K         = na     // target (price to beat) of the current window
+var bool  kByTick   = false
+var float ckP       = na     // model P(UP) at the calibration checkpoint
+var int   biasOpen  = 0      // momentum direction at the open: −1 / 0 / +1
+var line  tgtLine   = na
+var array<int>   stOut  = array.new<int>()
+var array<int>   stBias = array.new<int>()
+var array<float> stCk   = array.new<float>()
+
+if newWin
+    // 1) Record how the window that just ended settled.
+    if not na(K) and not na(settlePrev) and prevEnd == wStart
+        bool isUp = settlePrev >= K
+        stOut.push(isUp ? 1 : 0)
+        stBias.push(biasOpen)
+        stCk.push(ckP)
+        if stOut.size() > statN
+            stOut.shift()
+            stBias.shift()
+            stCk.shift()
+        if not na(tgtLine)
+            tgtLine.set_color(color.new(isUp ? colUp : colDn, 35))
+            tgtLine.set_width(1)
+        if showMarks and tfOk
+            string tip = str.format_time(wStart - winMs, "HH:mm", tzName) + "–" + str.format_time(wStart, "HH:mm", tzName) + (isUp ? "  ▲ UP" : "  ▼ DOWN") + "\nTarget " + f_usd(K) + "\nSettle ≈ " + f_usd(settlePrev) + " (" + f_sgnUsd(settlePrev - K) + ")" + "\nModel P(UP) at " + str.tostring(ckMin) + " min: " + f_pct(ckP) + "\nMomentum at open: " + (biasOpen > 0 ? "UP" : biasOpen < 0 ? "DOWN" : "neutral")
+            label.new(wStart, settlePrev, isUp ? "▲" : "▼", xloc = xloc.bar_time, style = label.style_none, textcolor = isUp ? colUp : colDn, size = size.small, tooltip = tip, force_overlay = true)
+    // 2) Open the new window.
+    K        := prevEnd == wStart ? settlePrev : na
+    kByTick  := prevEnd == wStart and not na(sTickPrev)
+    ckP      := na
+    biasOpen := biasPrev > leanThr ? 1 : biasPrev < -leanThr ? -1 : 0
+    tgtLine  := na
+    if showLines and tfOk and not na(K)
+        tgtLine := line.new(wStart, K, wEnd, K, xloc = xloc.bar_time, color = colTgt, width = 2, force_overlay = true)
+
+// ─── Probability ─────────────────────────────────────────────────────────────
+// Drift (bp per minute) such that the bias moves z by tiltK·bias at the open.
+float mu    = tiltK > 0 and not na(sig) ? tiltK * bias * sig / math.sqrt(winMs / 60000.0) : 0.0
+float pFair = f_probUp(pxC, K, tRem, rZone, sig, 0.0, avgMs, tailNu)
+float pMod  = tiltK > 0 ? f_probUp(pxC, K, tRem, rZone, sig, mu, avgMs, tailNu) : pFair
+float zNow  = f_zScore(pxC, K, tRem, rZone, sig, mu, avgMs)
+
+int ckMs = math.max(barMs, math.min(ckMin * 60000, winMs - barMs))
+if na(ckP) and not na(pMod) and tEl >= ckMs and tRem > 0
+    ckP := pMod
+
+// ─── Chart drawings ──────────────────────────────────────────────────────────
+var line  cU1    = na
+var line  cL1    = na
+var line  cU2    = na
+var line  cL2    = na
+var label endLbl = na
+if barstate.islast
+    line.delete(cU1)
+    line.delete(cL1)
+    line.delete(cU2)
+    line.delete(cL2)
+    label.delete(endLbl)
+    cU1    := na
+    cL1    := na
+    cU2    := na
+    cL2    := na
+    endLbl := na
+    if tfOk and not na(K)
+        if showCone and tRem > 0 and not na(sig)
+            cU1 := line.new(time, pxC, wEnd, f_settleQ(pxC, tRem, rZone, sig, mu, avgMs, 1.0), xloc = xloc.bar_time, color = color.new(colUp, 25), style = line.style_dashed, force_overlay = true)
+            cL1 := line.new(time, pxC, wEnd, f_settleQ(pxC, tRem, rZone, sig, mu, avgMs, -1.0), xloc = xloc.bar_time, color = color.new(colDn, 25), style = line.style_dashed, force_overlay = true)
+            cU2 := line.new(time, pxC, wEnd, f_settleQ(pxC, tRem, rZone, sig, mu, avgMs, 2.0), xloc = xloc.bar_time, color = color.new(colUp, 60), style = line.style_dotted, force_overlay = true)
+            cL2 := line.new(time, pxC, wEnd, f_settleQ(pxC, tRem, rZone, sig, mu, avgMs, -2.0), xloc = xloc.bar_time, color = color.new(colDn, 60), style = line.style_dotted, force_overlay = true)
+        if showLines
+            endLbl := label.new(wEnd, K, str.format_time(wEnd, "HH:mm", tzName) + " close · beat " + f_usd(K), xloc = xloc.bar_time, style = label.style_label_left, color = color.new(colTgt, 80), textcolor = colTgt, size = size.small, force_overlay = true)
+
+bool inZoneBar = tfOk and time + barMs > zStart
+bgcolor(showZone and inZoneBar ? color.new(colTgt, 85) : na, title = "Averaging minute (price pane)", force_overlay = true)
+bgcolor(showZone and inZoneBar ? color.new(colTgt, 90) : na, title = "Averaging minute (probability pane)")
+
+// ─── Plots ───────────────────────────────────────────────────────────────────
+color pCol = na(pMod) ? na : pMod >= 0.5 ? color.from_gradient(pMod, 0.5, 1.0, C_NEU, colUp) : color.from_gradient(pMod, 0.0, 0.5, colDn, C_NEU)
+plot(showBias ? 50.0 + 50.0 * bias : na, "Momentum bias", color = bias >= 0 ? color.new(colUp, 70) : color.new(colDn, 70), style = plot.style_columns, histbase = 50.0)
+plot(tiltK > 0 ? pFair * 100.0 : na, "Fair P(UP) % (no tilt)", color = color.new(C_NEU, 20), linewidth = 1)
+plot(pMod * 100.0, "P(UP) %", color = pCol, linewidth = 2)
+hline(50, "50%", color = C_NEU, linestyle = hline.style_dotted)
+hline(hiThr, "UP threshold", color = colUp, linestyle = hline.style_dashed)
+hline(loThr, "DOWN threshold", color = colDn, linestyle = hline.style_dashed)
+plot(K, "Price to beat", color = colTgt, display = display.price_scale + display.data_window, force_overlay = true, precision = 2)
+plot(showProxy and compOk ? pxC : na, "Composite price", color = color.new(color.white, 40), force_overlay = true, precision = 2)
+
+// ─── Dashboard ───────────────────────────────────────────────────────────────
+var table dash = table.new(tbPos, 2, 22, bgcolor = color.new(C_BG, 8), frame_color = color.new(C_NEU, 60), frame_width = 1, border_color = color.new(C_NEU, 85), border_width = 1, force_overlay = true)
+if showTable and barstate.islast
+    dash.clear(0, 0, 1, 21)
+    string tzLbl   = tzName == "America/New_York" ? "ET" : tzName
+    string winTxt  = str.format_time(wStart, "HH:mm", tzName) + "–" + str.format_time(wEnd, "HH:mm", tzName) + " " + tzLbl
+    string srcTip  = compOk ? "USD spot composite: " + str.tostring(nLive) + " of " + str.tostring(nOn) + " exchanges returning data." : "Chart symbol: " + syminfo.tickerid
+    float  dist    = pxC - K
+    bool   inZone  = tRem > 0 and tRem < avgMs
+    float  rr      = na(rZone) ? pxC : rZone
+    float  kEffNow = inZone and not na(K) ? (avgMs * K - (avgMs - tRem) * rr) / tRem : na
+    float  q50     = f_settleQ(pxC, tRem, rZone, sig, mu, avgMs, 0.0)
+    float  band    = (f_settleQ(pxC, tRem, rZone, sig, mu, avgMs, 1.0) - f_settleQ(pxC, tRem, rZone, sig, mu, avgMs, -1.0)) / 2.0
+    int    yesMax  = f_maxBuy(pMod, feeK, edgeC / 100.0)
+    int    noMax   = f_maxBuy(na(pMod) ? na : 1.0 - pMod, feeK, edgeC / 100.0)
+    string valTxt  = "YES " + (yesMax > 0 ? str.tostring(yesMax) + "¢" : "—") + " · NO " + (noMax > 0 ? str.tostring(noMax) + "¢" : "—")
+    string verdict = na(K) ? "Waiting for a full window" : tRem <= 0 ? (rr >= K ? "Closed ▲ UP (est.)" : "Closed ▼ DOWN (est.)") : pMod >= hiThr / 100.0 ? "▲ UP favored" : pMod <= loThr / 100.0 ? "▼ DOWN favored" : "Toss-up" + (biasDir > 0 ? " · lean ▲" : biasDir < 0 ? " · lean ▼" : "")
+    color  vCol    = na(K) or na(pMod) ? C_TXT : pMod >= hiThr / 100.0 ? colUp : pMod <= loThr / 100.0 ? colDn : C_TXT
+    string biasTxt = (biasDir > 0 ? "▲ UP lean " : biasDir < 0 ? "▼ DOWN lean " : "Neutral ") + f_sgn2(bias)
+    [sn, sUps, sbN, sbHit, scN, scWin, scPred] = f_stats(stOut, stBias, stCk)
+
+    dash.cell(0, 0, "Kalshi BTC " + str.tostring(winMin) + "m", text_color = colTgt, text_halign = text.align_left, text_size = tbSize)
+    dash.cell(1, 0, winTxt, text_color = C_TXT, text_halign = text.align_right, text_size = tbSize)
+    int r = 1
+    r := f_row(dash, r, "Time left", f_mmss(wEnd - tEval), C_TXT, na, "Countdown to this window's close. Updates on every tick.", tbSize)
+    r := f_row(dash, r, "Price to beat", f_usd(K), colTgt, na, "Estimated 60-second average before the open, from " + (kByTick ? "live ticks" : "bars") + ". Kalshi shows the official target on the market page; compare the two.", tbSize)
+    r := f_row(dash, r, "BTC now", f_usd(pxC), C_TXT, na, srcTip, tbSize)
+    r := f_row(dash, r, "Distance", f_sgnUsd(dist) + (na(zNow) ? "" : " · " + f_sgn2(zNow) + "σ"), na(dist) ? C_TXT : dist >= 0 ? colUp : colDn, na, "Current price minus target, and how many standard deviations of the remaining move that is.", tbSize)
+    if inZone
+        r := f_row(dash, r, "Locked in", f_usd(rZone) + " (" + str.tostring(100.0 * (avgMs - tRem) / avgMs, "0") + "%)", C_TXT, na, "Average so far of the final averaging minute. That part of the settlement is fixed.", tbSize)
+        r := f_row(dash, r, "Rest must avg", "≥ " + f_usd(kEffNow), na(kEffNow) ? C_TXT : pxC >= kEffNow ? colUp : colDn, na, "YES wins if the rest of the final minute averages at least this.", tbSize)
+    r := f_row(dash, r, "P(UP)", f_pct(pMod), color.white, na(pMod) ? na : color.new(pCol, 20), "Model probability that the settlement average finishes at or above the target" + (tiltK > 0 ? " (includes momentum tilt)." : " (random-walk fair value)."), tbSize)
+    r := f_row(dash, r, "Fair YES / NO", f_cents(pMod) + " / " + f_cents(na(pMod) ? na : 1.0 - pMod), C_TXT, na, "Fair contract prices implied by P(UP).", tbSize)
+    r := f_row(dash, r, "Value buy ≤", valTxt, C_TXT, na, "Highest price that still leaves " + str.tostring(edgeC, "0.0") + "¢ expected profit per contract after the fee (coefficient " + str.tostring(feeK, "0.000") + "). Compare with Kalshi's ask.", tbSize)
+    r := f_row(dash, r, "Signal", verdict, vCol, na, "UP/DOWN favored when P(UP) crosses your thresholds; otherwise the momentum lean is shown.", tbSize)
+    r := f_row(dash, r, "Momentum", biasTxt, biasDir > 0 ? colUp : biasDir < 0 ? colDn : C_TXT, na, "Average of EMA trend, momentum, distance from rolling VWAP and buy/sell pressure, each scaled to −1…+1. Check 'Momentum@open hit' before trusting it.", tbSize)
+    if not compactTb
+        r := f_row(dash, r, "Settle est. ±1σ", tRem > 0 ? f_usd0(q50) + " ± " + f_usd0(band) : f_usd(q50) + " (closed)", C_TXT, na, "Median expected settlement average and its 1σ range (the cone on the chart shows ±1σ and ±2σ).", tbSize)
+        if tiltK > 0
+            r := f_row(dash, r, "Fair (no tilt)", f_pct(pFair), C_TXT, na, "Random-walk probability without the momentum tilt.", tbSize)
+        r := f_row(dash, r, "Volatility", "σ15m " + f_usd0(sdWin) + " (" + (na(sdWin) ? "—" : str.tostring(100.0 * sdWin / pxC, "0.00") + "%") + ")", C_TXT, na, "Typical 1σ move over a full window, from realized volatility.", tbSize)
+        r := f_row(dash, r, "Last " + str.tostring(sn) + " windows", sn > 0 ? "UP " + str.tostring(100.0 * sUps / sn, "0") + "%" : "—", C_TXT, na, "Share of finished windows on this chart that settled UP (estimated from the proxy).", tbSize)
+        r := f_row(dash, r, "Momentum@open hit", sbN > 0 ? str.tostring(100.0 * sbHit / sbN, "0") + "% of " + str.tostring(sbN) : "no calls yet", C_TXT, na, "How often the momentum lean at the open called the window correctly (only windows with a lean). 50% = no edge.", tbSize)
+        r := f_row(dash, r, "Calib @" + str.tostring(ckMin) + "m", scN > 0 ? "pred " + str.tostring(100.0 * scPred / scN, "0") + "% · real " + str.tostring(100.0 * scWin / scN, "0") + "%" : "—", C_TXT, na, "Average confidence of the model's favorite at the checkpoint vs. how often that favorite actually won (n = " + str.tostring(scN) + "). Real well above pred: lower the volatility multiplier. Well below: raise it.", tbSize)
+    string warn = not tfOk ? "Use a 1s–15m chart that divides 15m (1m is best)" : barMs > avgMs ? "Timeframe > 1m: averages are approximate" : useComp and nLive == 0 ? "No composite data: using the chart symbol" : not useComp and syminfo.currency != "USD" ? "Chart quoted in " + syminfo.currency + "; Kalshi uses a USD index" : ""
+    if warn != ""
+        r := f_row(dash, r, "⚠ Note", warn, color.orange, na, warn, tbSize)
+
+// ─── Alerts ──────────────────────────────────────────────────────────────────
+bool xUp     = ta.crossover(pMod * 100.0, hiThr)
+bool xDn     = ta.crossunder(pMod * 100.0, loThr)
+bool upCross = xUp and tRem > 0 and not newWin
+bool dnCross = xDn and tRem > 0 and not newWin
+alertcondition(upCross, "P(UP) crossed above the UP threshold", "Kalshi BTC 15m: P(UP) crossed above the UP threshold.")
+alertcondition(dnCross, "P(UP) crossed below the DOWN threshold", "Kalshi BTC 15m: P(UP) crossed below the DOWN threshold.")
+alertcondition(newWin and tfOk, "New window opened", "Kalshi BTC 15m: a new window opened.")
+if barstate.isrealtime and tfOk
+    string winA = str.format_time(wStart, "HH:mm", tzName) + "–" + str.format_time(wEnd, "HH:mm", tzName)
+    if newWin and not na(K)
+        alert("Kalshi BTC 15m · new window " + winA + " · target ≈ " + f_usd(K) + " · momentum " + f_sgn2(bias), alert.freq_once_per_bar)
+    if upCross
+        alert("Kalshi BTC 15m · " + winA + " · P(UP) " + f_pct(pMod) + " · " + f_mmss(tRem) + " left · BTC " + f_usd(pxC) + " vs target " + f_usd(K), alert.freq_once_per_bar)
+    if dnCross
+        alert("Kalshi BTC 15m · " + winA + " · P(UP) " + f_pct(pMod) + " · " + f_mmss(tRem) + " left · BTC " + f_usd(pxC) + " vs target " + f_usd(K), alert.freq_once_per_bar)
